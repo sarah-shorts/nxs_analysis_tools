@@ -3,8 +3,9 @@ Module for fitting of linecuts using the lmfit package.
 """
 
 import operator
-from lmfit.model import Model
-from lmfit.model import CompositeModel
+from lmfit import Parameters
+from lmfit.model import Model, CompositeModel
+from lmfit.models import PseudoVoigtModel, LinearModel
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -41,7 +42,7 @@ class LinecutModel:
         The composite model used for fitting.
     modelresult : ModelResult or None
         The result of the model fitting.
-    data : NXdata or None
+    data : :class:`nexusformat.nexus.tree.NXdata` or None
         The 1D linecut data used for analysis.
 
     Methods
@@ -66,6 +67,8 @@ class LinecutModel:
         Fit the model to the data.
     plot_fit(self, numpoints=None, fit_report=True, **kwargs)
         Plot the fitted model.
+    fit_peak_simple():
+        Perform a basic fit using a pseudo-Voigt peak shape, linear background, and no constraints.
     print_fit_report(self)
         Print the fit report.
     """
@@ -88,8 +91,8 @@ class LinecutModel:
         self.modelresult = None
         self.data = data if data is not None else None
         if self.data is not None:
-            self.x = data[data.axes].nxdata
-            self.y = data[data.signal].nxdata
+            self.x = data.nxaxes[0].nxdata
+            self.y = data.nxsignal.nxdata
 
     def set_data(self, data):
         """
@@ -97,12 +100,12 @@ class LinecutModel:
 
         Parameters
         ----------
-        data : NXdata
+        data : :class:`nexusformat.nexus.tree.NXdata`
             The 1D linecut data to be used for analysis.
         """
         self.data = data
-        self.x = data[data.axes].nxdata
-        self.y = data[data.signal].nxdata
+        self.x = data.nxaxes[0].nxdata
+        self.y = data.nxsignal.nxdata
 
     def set_model_components(self, model_components):
         """
@@ -110,15 +113,25 @@ class LinecutModel:
 
         Parameters
         ----------
-        model_components : Model or list of Models
-            The model component(s) to be used for fitting,
-             which will be combined into a CompositeModel.
+        model_components : Model, CompositeModel, or iterable of Model
+            The model component(s) to be used for fitting.
         """
 
         # If the model only has one component, then use it as the model
         if isinstance(model_components, Model):
             self.model = model_components
-        # Else, combine the components into a composite model and use that as the
+            self.params = self.model.make_params()
+
+        # If the model is a composite model, then use it as the model
+        elif isinstance(model_components, CompositeModel):
+            self.model = model_components
+            self.model_components = self.model.components
+            # Make params for each component of the model
+            self.params = Parameters()
+            for component in self.model.components:
+                self.params.update(component.make_params())
+
+        # Else, combine the components into a composite model and use that as the model
         else:
             self.model_components = model_components
             self.model = model_components[0]
@@ -127,9 +140,15 @@ class LinecutModel:
             for component in model_components[1:]:
                 self.model = CompositeModel(self.model, component, operator.add)
 
+            # Make params for each component of the model
+            self.params = Parameters()
+            for component in self.model.components:
+                self.params.update(component.make_params())
+
     def set_param_hint(self, *args, **kwargs):
         """
-        Set parameter hints for the model.
+        Set parameter hints for the model. These are implemented when the .make_params() method
+        is called.
 
         Parameters
         ----------
@@ -151,7 +170,7 @@ class LinecutModel:
         Parameters
             The initialized parameters for the model.
         """
-        # Intialize empty parameters (in function)
+        # Initialize empty parameters (in function)
         params = self.model.make_params()
         self.params = params
 
@@ -159,10 +178,22 @@ class LinecutModel:
 
     def guess(self):
         """
-        Perform initial guesses for each model component.
+        Perform initial guesses for each model component and update params. This overwrites any
+        prior initial values and constraints.
+
+        Returns
+        -------
+        components_params : list
+            A list containing params objects for each component of the model.
         """
-        for model_component in list(self.model_components):
+        
+        components_params = []
+        
+        for model_component in self.model.components:
             self.params.update(model_component.guess(self.y, x=self.x))
+            components_params.append(model_component.guess(self.y, x=self.x))
+        
+        return components_params
 
     def print_initial_params(self):
         """
@@ -232,7 +263,7 @@ class LinecutModel:
 
         Returns
         -------
-        ax : matplotlib.axes.Axes
+        ax : :class:`matplotlib.axes.Axes`
             The Axes object containing the plot.
 
         """
@@ -251,6 +282,17 @@ class LinecutModel:
         if fit_report:
             print(self.modelresult.fit_report())
         return ax
+    
+    def fit_peak_simple(self):
+        """
+        Fit all linecuts in the temperature series using a pseudo-Voigt peak shape and linear
+        background, with no constraints.
+        """
+        self.set_model_components([PseudoVoigtModel(prefix='peak'),
+                                            LinearModel(prefix='background')])
+        self.make_params()
+        self.guess()
+        self.fit()
 
     def print_fit_report(self):
         """

@@ -1,17 +1,18 @@
 # keep consistent with _meta/__init__.py
 
 [build-system]
-requires = ['setuptools>=61.2.0', 'wheel']
+requires = ['setuptools>=61.2.0', 'wheel', 'setuptools_scm[toml]']
 build-backend = 'setuptools.build_meta'
 
 [project]
 name = 'nxs-analysis-tools'
-version = '0.0.48'
+dynamic = ["version"]
 description = 'Reduce and transform nexus format (.nxs) scattering data.'
 readme = 'README.md'
-requires-python = '>=3.7'
-license = { file = 'LICENSE' }
-authors = [{ name = 'Steven J. Gomez Alvarado', email = 'stevenjgomez@ucsb.edu' }]
+requires-python = '>=3.10'
+license = "MIT"
+license-files = ['LICENSE']
+authors = [{ name = 'Steven J. Gomez Alvarado', email = 'sjgomezalvarado@gmail.com' }]
 
 keywords = [
     'diffraction',
@@ -22,31 +23,31 @@ keywords = [
     'scattering',
 ]
 classifiers = [
-    'Development Status :: 1 - Planning',
+    'Development Status :: 5 - Production/Stable',
     'Intended Audience :: Science/Research',
-    'License :: OSI Approved :: MIT License',
     'Programming Language :: Python',
     'Programming Language :: Python :: 3',
-    'Programming Language :: Python :: 3.9',
     'Programming Language :: Python :: 3.10',
     'Topic :: Scientific/Engineering :: Image Processing',
     'Topic :: Scientific/Engineering',
 ]
 dependencies = [
     'matplotlib>=3.10.0',
-    'numpy>=2.0.0',
+    'numpy>=2.2.4',
     'ipython>=1.0.0',
-    'pandas>=2.0.2',
-    'nexusformat>=1.0.8',
+    'pandas>=2.2.3',
+    'nexusformat>=1.0.8,<2.0.0,!=2.0.0.*',
     'lmfit>=1.2.1',
-    'astropy>=7.0.1',
+    'astropy>=6.1.7',
     'pyfftw>=0.13.1',
-    'scipy>=1.14.1'
+    'scipy>=1.14.1',
+    'h5py>=3.13.0',
     ]
 
 [project.optional-dependencies]
 dev = [
     'build >= 0.8.0',
+    'setuptools_scm[toml]',
     'furo >= 2022.6.21',
     'ipykernel >= 6.9.1',
     'myst-nb >= 0.16.0',
@@ -60,6 +61,7 @@ dev = [
     'sphinx-copybutton >= 0.5.0',
     'sphinxext-opengraph >= 0.6.3',
     'twine >= 4.0.1',
+    'pooch >= 1.8.2',
 ]
 
 [project.urls]
@@ -67,3 +69,10 @@ dev = [
 'Bug Tracker' = 'https://github.com/stevenjgomez/nxs_analysis_tools/issues'
 'Documentation' = 'https://nxs-analysis-tools.readthedocs.io/en/stable/'
 'Source Code' = 'https://github.com/stevenjgomez/nxs_analysis_tools'
+'DOI' = 'https://doi.org/10.5281/zenodo.15186359'
+
+[tool.setuptools_scm]
+version_file = "src/nxs_analysis_tools/_version.py"
+version_scheme = "post-release"
+local_scheme = "node-and-date"
+fallback_version = "0.1.0"

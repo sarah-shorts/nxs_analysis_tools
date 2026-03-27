@@ -5,7 +5,8 @@ import time
 import os
 import gc
 import math
-from scipy import ndimage
+import warnings
+from scipy.ndimage import rotate, affine_transform
 import scipy
 import matplotlib.pyplot as plt
 from matplotlib.transforms import Affine2D
@@ -15,6 +16,7 @@ from astropy.convolution import Kernel, convolve_fft
 import pyfftw
 from .datareduction import plot_slice, reciprocal_lattice_params, Padder, \
     array_to_nxdata
+from .lineartransformations import ShearTransformer
 
 __all__ = ['Symmetrizer2D', 'Symmetrizer3D', 'Puncher', 'Interpolator',
            'fourier_transform_nxdata', 'Gaussian3DKernel', 'DeltaPDF',
@@ -34,11 +36,8 @@ class Symmetrizer2D:
     mirror_axis : int or None
         The axis along which mirroring is performed. Default is None, meaning
         no mirroring is applied.
-    symmetrized : NXdata or None
+    symmetrized : :class:`nexusformat.nexus.tree.NXdata` or None
         The symmetrized dataset after applying the symmetrization operations.
-        Default is None until symmetrization is performed.
-    wedges : NXdata or None
-        The wedges extracted from the dataset based on the angular limits.
         Default is None until symmetrization is performed.
     rotations : int or None
         The number of rotations needed to reconstruct the full dataset from
@@ -58,10 +57,10 @@ class Symmetrizer2D:
     theta_min : float or None
         The minimum angle (in degrees) for symmetrization. Default is None
          until parameters are set.
-    wedge : NXdata or None
+    wedge : :class:`nexusformat.nexus.tree.NXdata` or None
         The dataset wedge used in the symmetrization process. Default is
          None until symmetrization is performed.
-    symmetrization_mask : NXdata or None
+    symmetrization_mask : :class:`nexusformat.nexus.tree.NXdata` or None
         The mask used for selecting the region of the dataset to be symmetrized.
          Default is None until symmetrization is performed.
 
@@ -93,7 +92,6 @@ class Symmetrizer2D:
         """
         self.mirror_axis = None
         self.symmetrized = None
-        self.wedges = None
         self.rotations = None
         self.transform = None
         self.mirror = None
@@ -104,7 +102,7 @@ class Symmetrizer2D:
         if kwargs:
             self.set_parameters(**kwargs)
 
-    def set_parameters(self, theta_min, theta_max, lattice_angle=90, mirror=True, mirror_axis=0):
+    def set_parameters(self, theta_min, theta_max, lattice_angle=90, mirror=True, mirror_axis=None):
         """
         Sets the parameters for the symmetrization operation, and calculates the
          required transformations and rotations.
@@ -127,18 +125,20 @@ class Symmetrizer2D:
         self.theta_max = theta_max
         self.skew_angle = lattice_angle
         self.mirror = mirror
-        self.mirror_axis = mirror_axis
+        if mirror:
+            if mirror_axis is None:
+                self.mirror_axis = 0
+                warnings.warn(
+                    "mirror_axis not specified. Defaulting to 0. "
+                    "Set mirror_axis explicitly when using mirror=True.",
+                    UserWarning,
+                    stacklevel=2
+                )
+            else:
+                self.mirror_axis = mirror_axis
 
-        # Define Transformation
-        skew_angle_adj = 90 - lattice_angle
-        t = Affine2D()
-        # Scale y-axis to preserve norm while shearing
-        t += Affine2D().scale(1, np.cos(skew_angle_adj * np.pi / 180))
-        # Shear along x-axis
-        t += Affine2D().skew_deg(skew_angle_adj, 0)
-        # Return to original y-axis scaling
-        t += Affine2D().scale(1, np.cos(skew_angle_adj * np.pi / 180)).inverted()
-        self.transform = t
+        self.transformer = ShearTransformer(lattice_angle)
+        self.transform = self.transformer.t
 
         # Calculate number of rotations needed to reconstruct the dataset
         if mirror:
@@ -160,68 +160,46 @@ class Symmetrizer2D:
 
         Parameters
         ----------
-        data : NXdata
+        data : :class:`nexusformat.nexus.tree.NXdata`
             The input 2D dataset to be symmetrized.
 
         Returns
         -------
-        symmetrized : NXdata
+        symmetrized : :class:`nexusformat.nexus.tree.NXdata`
             The symmetrized 2D dataset.
         """
         theta_min = self.theta_min
         theta_max = self.theta_max
         mirror = self.mirror
         mirror_axis = self.mirror_axis
-        t = self.transform
         rotations = self.rotations
 
         # Pad the dataset so that rotations don't get cutoff if they extend
         # past the extent of the dataset
         p = Padder(data)
-        padding = tuple(len(data[axis]) for axis in data.axes)
+        padding = tuple(len(axis) for axis in data.nxaxes)
         data_padded = p.pad(padding)
 
         # Define axes that span the plane to be transformed
-        q1 = data_padded[data.axes[0]]
-        q2 = data_padded[data.axes[1]]
+        q1 = data_padded.nxaxes[0]
+        q2 = data_padded.nxaxes[1]
 
-        # Calculate the angle for each data point
+        # Calculate the angle in radians
         theta = np.arctan2(q1.reshape((-1, 1)), q2.reshape((1, -1)))
-        # Create a boolean array for the range of angles
-        symmetrization_mask = np.logical_and(theta >= theta_min * np.pi / 180,
-                                             theta <= theta_max * np.pi / 180)
+        theta = np.mod(theta, 2 * np.pi)
 
-        # Define signal to be transformed
-        counts = symmetrization_mask
+        # Convert min/max to radians and map to [0, 2pi)
+        theta_min_rad = np.deg2rad(theta_min % 360)
+        theta_max_rad = np.deg2rad(theta_max % 360)
 
-        # Scale and skew counts
-        skew_angle_adj = 90 - self.skew_angle
+        # Handle wraparound cases
+        if theta_min_rad <= theta_max_rad:
+            symmetrization_mask = (theta >= theta_min_rad) & (theta <= theta_max_rad)
+        else:
+            symmetrization_mask = (theta >= theta_min_rad) | (theta <= theta_max_rad)
 
-        scale2 = 1 # q1.max()/q2.max() # TODO: Need to double check this
-        counts_unscaled2 = ndimage.affine_transform(counts,
-                                                    Affine2D().scale(scale2, 1).inverted().get_matrix()[:2, :2],
-                                                    offset=[-(1 - scale2) * counts.shape[
-                                                        0] / 2 / scale2, 0],
-                                                    order=0,
-                                                    )
-
-        scale1 = np.cos(skew_angle_adj * np.pi / 180)
-        counts_unscaled1 = ndimage.affine_transform(counts_unscaled2,
-                                                    Affine2D().scale(scale1, 1).inverted().get_matrix()[:2, :2],
-                                                    offset=[-(1 - scale1) * counts.shape[
-                                                        0] / 2 / scale1, 0],
-                                                    order=0,
-                                                    )
-
-        mask = ndimage.affine_transform(counts_unscaled1,
-                                        t.get_matrix()[:2, :2],
-                                        offset=[-counts.shape[0] / 2
-                                                * np.sin(skew_angle_adj * np.pi / 180), 0],
-                                        order=0,
-                                        )
-
-        # Convert mask to nxdata
-        mask = array_to_nxdata(mask, data_padded)
+        # Bring mask from skewed basis to data array basis
+        mask = array_to_nxdata(self.transformer.invert(symmetrization_mask), data_padded)
 
         # Save mask for user interaction
         self.symmetrization_mask = p.unpad(mask)
@@ -233,88 +211,53 @@ class Symmetrizer2D:
         self.wedge = p.unpad(wedge)
 
         # Convert wedge back to array for further transformations
-        wedge = wedge[data.signal].nxdata
+        wedge = wedge[data.nxsignal.nxname].nxdata
 
-        # Define signal to be transformed
-        counts = wedge
+        # Bring wedge from data array basis to skewed basis for reconstruction
+        wedge = self.transformer.apply(wedge)
 
-        # Scale and skew counts
-        skew_angle_adj = 90 - self.skew_angle
-        counts_skew = ndimage.affine_transform(counts,
-                                               t.inverted().get_matrix()[:2, :2],
-                                               offset=[counts.shape[0] / 2
-                                                       * np.sin(skew_angle_adj * np.pi / 180), 0],
-                                               order=0,
-                                               )
-        scale1 = np.cos(skew_angle_adj * np.pi / 180)
-        wedge = ndimage.affine_transform(counts_skew,
-                                         Affine2D().scale(scale1, 1).get_matrix()[:2, :2],
-                                         offset=[(1 - scale1) * counts.shape[0] / 2, 0],
-                                         order=0,
-                                         )
-
-        scale2 = counts.shape[0]/counts.shape[1]
-        wedge = ndimage.affine_transform(wedge,
-                                         Affine2D().scale(scale2, 1).get_matrix()[:2, :2],
-                                         offset=[(1 - scale2) * counts.shape[0] / 2, 0],
+        # Apply additional scaling before rotations
+        scale = wedge.shape[0]/wedge.shape[1]
+        wedge = affine_transform(wedge,
+                                         Affine2D().scale(scale, 1).get_matrix()[:2, :2],
+                                         offset=[(1 - scale) * wedge.shape[0] / 2, 0],
                                          order=0,
                                          )
 
         # Reconstruct full dataset from wedge
-        reconstructed = np.zeros(counts.shape)
+        reconstructed = np.zeros(wedge.shape)
+
         for _ in range(0, rotations):
-            # The following are attempts to combine images with minimal overlapping pixels
             reconstructed += wedge
-            # reconstructed = np.where(reconstructed == 0, reconstructed + wedge, reconstructed)
-
-            wedge = ndimage.rotate(wedge, 360 / rotations, reshape=False, order=0)
-
-        # self.rotated_only = NXdata(NXfield(reconstructed, name=data.signal),
-        #                            (q1, q2))
+            wedge = rotate(wedge, 360 / rotations, reshape=False, order=0)
 
         if mirror:
-            # The following are attempts to combine images with minimal overlapping pixels
             reconstructed = np.where(reconstructed == 0,
                                      reconstructed + np.flip(reconstructed, axis=mirror_axis),
                                      reconstructed)
-            # reconstructed += np.flip(reconstructed, axis=0)
+            
 
-        # self.rotated_and_mirrored = NXdata(NXfield(reconstructed, name=data.signal),
-        #                                    (q1, q2))
-
-        reconstructed = ndimage.affine_transform(reconstructed,
+        # Undo scaling transformation
+        reconstructed = affine_transform(reconstructed,
                                                  Affine2D().scale(
-                                                     scale2, 1
+                                                     scale, 1
                                                  ).inverted().get_matrix()[:2, :2],
-                                                 offset=[-(1 - scale2) * counts.shape[
-                                                     0] / 2 / scale2, 0],
+                                                 offset=[-(1 - scale) * wedge.shape[
+                                                     0] / 2 / scale, 0],
                                                  order=0,
                                                  )
-        reconstructed = ndimage.affine_transform(reconstructed,
-                                                 Affine2D().scale(
-                                                     scale1, 1
-                                                 ).inverted().get_matrix()[:2, :2],
-                                                 offset=[-(1 - scale1) * counts.shape[
-                                                     0] / 2 / scale1, 0],
-                                                 order=0,
-                                                 )
-        reconstructed = ndimage.affine_transform(reconstructed,
-                                                 t.get_matrix()[:2, :2],
-                                                 offset=[(-counts.shape[0] / 2
-                                                          * np.sin(skew_angle_adj * np.pi / 180)),
-                                                         0],
-                                                 order=0,
-                                                 )
+        
+        reconstructed = self.transformer.invert(reconstructed)
 
-        reconstructed_unpadded = p.unpad(reconstructed)
+        reconstructed = p.unpad(reconstructed)
 
         # Fix any overlapping pixels by truncating counts to max
-        reconstructed_unpadded[reconstructed_unpadded > data[data.signal].nxdata.max()] \
-            = data[data.signal].nxdata.max()
+        reconstructed[reconstructed > data.nxsignal.nxdata.max()] \
+            = data.nxsignal.nxdata.max()
 
-        symmetrized = NXdata(NXfield(reconstructed_unpadded, name=data.signal),
-                             (data[data.axes[0]],
-                              data[data.axes[1]]))
+        symmetrized = NXdata(NXfield(reconstructed, name=data.nxsignal.nxname),
+                             (data.nxaxes[0],
+                              data.nxaxes[1]))
 
         return symmetrized
 
@@ -325,7 +268,7 @@ class Symmetrizer2D:
 
         Parameters
         ----------
-        data : ndarray
+        data : :class:`numpy.ndarray`
             The input 2D dataset to be used for the test visualization.
         **kwargs : dict
             Additional keyword arguments to be passed to the plot_slice function.
@@ -334,7 +277,7 @@ class Symmetrizer2D:
         -------
         fig : Figure
             The matplotlib Figure object that contains the test visualization plot.
-        axesarr : ndarray
+        axesarr : :class:`numpy.ndarray`
             The numpy array of Axes objects representing the subplots in the test
              visualization.
 
@@ -349,12 +292,11 @@ class Symmetrizer2D:
         - Subplot 3: The wedge slice used for reconstruction of the full symmetrized dataset.
         - Subplot 4: The symmetrized dataset.
 
-        Example usage:
-        ```
-        s = Symmetrizer2D()
-        s.set_parameters(theta_min, theta_max, skew_angle, mirror)
-        s.test(data)
-        ```
+        Example
+        -------
+        >>> s = Symmetrizer2D()
+        >>> s.set_parameters(theta_min, theta_max, skew_angle, mirror)
+        >>> s.test(data)
         """
         s = self
         symm_test = s.symmetrize_2d(data)
@@ -396,9 +338,12 @@ class Symmetrizer3D:
 
         Parameters
         ----------
-        data : NXdata, optional
+        data : :class:`nexusformat.nexus.tree.NXdata`, optional
             The input 3D dataset to be symmetrized.
         """
+
+        if data is None:
+            raise ValueError("Symmetrizer3D requires a 3D NXdata object for initialization.")
 
         self.a, self.b, self.c, self.al, self.be, self.ga = [None] * 6
         self.a_star, self.b_star, self.c_star, self.al_star, self.be_star, self.ga_star = [None] * 6
@@ -411,9 +356,9 @@ class Symmetrizer3D:
         self.plane3symmetrizer = Symmetrizer2D()
 
         if data is not None:
-            self.q1 = data[data.axes[0]]
-            self.q2 = data[data.axes[1]]
-            self.q3 = data[data.axes[2]]
+            self.q1 = data.nxaxes[0]
+            self.q2 = data.nxaxes[1]
+            self.q3 = data.nxaxes[2]
             self.plane1 = self.q1.nxname + self.q2.nxname
             self.plane2 = self.q1.nxname + self.q3.nxname
             self.plane3 = self.q2.nxname + self.q3.nxname
@@ -428,13 +373,21 @@ class Symmetrizer3D:
 
         Parameters
         ----------
-        data : NXdata
+        data : :class:`nexusformat.nexus.tree.NXdata`
             The input 3D dataset to be symmetrized.
         """
         self.data = data
-        self.q1 = data[data.axes[0]]
-        self.q2 = data[data.axes[1]]
-        self.q3 = data[data.axes[2]]
+        if data.shape == (data.nxaxes[0].shape[0], data.nxaxes[1].shape[0], data.nxaxes[2].shape[0]):
+            self.q1 = data.nxaxes[0]
+            self.q2 = data.nxaxes[1]
+            self.q3 = data.nxaxes[2]
+        elif data.shape == (data.nxaxes[0].shape[0]-1, data.nxaxes[1].shape[0]-1, data.nxaxes[2].shape[0]-1):
+            self.q1 = data.nxaxes[0][:-1]
+            self.q2 = data.nxaxes[1][:-1]
+            self.q3 = data.nxaxes[2][:-1]
+        else:
+            raise ValueError("Data shape does not match axes lengths.")
+
         self.plane1 = self.q1.nxname + self.q2.nxname
         self.plane2 = self.q1.nxname + self.q3.nxname
         self.plane3 = self.q2.nxname + self.q3.nxname
@@ -450,7 +403,8 @@ class Symmetrizer3D:
         Parameters
         ----------
         lattice_params : tuple of float
-            The lattice parameters (a, b, c, alpha, beta, gamma) in real space.
+            The lattice parameters (a, b, c, alpha, beta, gamma) in real space. These should be
+            provided in the order corresponding to the axes of the relevant dataset.
         """
         self.a, self.b, self.c, self.al, self.be, self.ga = lattice_params
         self.lattice_params = lattice_params
@@ -475,7 +429,7 @@ class Symmetrizer3D:
 
         Returns
         -------
-        NXdata
+        :class:`nexusformat.nexus.tree.NXdata`
             The symmetrized 3D dataset stored in the `symmetrized` attribute.
 
         Notes
@@ -490,7 +444,7 @@ class Symmetrizer3D:
         starttime = time.time()
         data = self.data
         q1, q2, q3 = self.q1, self.q2, self.q3
-        out_array = np.zeros(data[data.signal].shape)
+        out_array = np.zeros(data.nxsignal.shape)
 
         if self.plane1symmetrizer.theta_max is not None:
             print('Symmetrizing ' + self.plane1 + ' planes...')
@@ -498,7 +452,7 @@ class Symmetrizer3D:
                 print(f'Symmetrizing {q3.nxname}={value:.02f}.'
                       f'..', end='\r')
                 data_symmetrized = self.plane1symmetrizer.symmetrize_2d(data[:, :, k])
-                out_array[:, :, k] = data_symmetrized[data.signal].nxdata
+                out_array[:, :, k] = data_symmetrized[data.nxsignal.nxname].nxdata
             print('\nSymmetrized ' + self.plane1 + ' planes.')
 
         if self.plane2symmetrizer.theta_max is not None:
@@ -506,9 +460,9 @@ class Symmetrizer3D:
             for j, value in enumerate(q2):
                 print(f'Symmetrizing {q2.nxname}={value:.02f}...', end='\r')
                 data_symmetrized = self.plane2symmetrizer.symmetrize_2d(
-                    NXdata(NXfield(out_array[:, j, :], name=data.signal), (q1, q3))
+                    NXdata(NXfield(out_array[:, j, :], name=data.nxsignal.nxname), (q1, q3))
                 )
-                out_array[:, j, :] = data_symmetrized[data.signal].nxdata
+                out_array[:, j, :] = data_symmetrized[data.nxsignal.nxname].nxdata
             print('\nSymmetrized ' + self.plane2 + ' planes.')
 
         if self.plane3symmetrizer.theta_max is not None:
@@ -516,9 +470,9 @@ class Symmetrizer3D:
             for i, value in enumerate(q1):
                 print(f'Symmetrizing {q1.nxname}={value:.02f}...', end='\r')
                 data_symmetrized = self.plane3symmetrizer.symmetrize_2d(
-                    NXdata(NXfield(out_array[i, :, :], name=data.signal), (q2, q3))
+                    NXdata(NXfield(out_array[i, :, :], name=data.nxsignal.nxname), (q2, q3))
                 )
-                out_array[i, :, :] = data_symmetrized[data.signal].nxdata
+                out_array[i, :, :] = data_symmetrized[data.nxsignal.nxname].nxdata
             print('\nSymmetrized ' + self.plane3 + ' planes.')
 
         if positive_values:
@@ -527,8 +481,8 @@ class Symmetrizer3D:
         stoptime = time.time()
         print(f"\nSymmetrization finished in {((stoptime - starttime) / 60):.02f} minutes.")
 
-        self.symmetrized = NXdata(NXfield(out_array, name=data.signal),
-                                  tuple(data[axis] for axis in data.axes))
+        self.symmetrized = NXdata(NXfield(out_array, name=data.nxsignal.nxname),
+                                  tuple(axis for axis in data.nxaxes))
 
         return self.symmetrized
 
@@ -562,15 +516,16 @@ def generate_gaussian(H, K, L, amp, stddev, lattice_params, coeffs=None, center=
 
     Parameters
     ----------
-    H, K, L : ndarray
-        Arrays specifying the values of H, K, and L coordinates in reciprocal space.
+    H, K, L : :class:`numpy.ndarray` or :class:`nexusformat.nexus.tree.NXfield`
+        The three principal axes of the reciprocal space grid. These should be provided in the 
+        order corresponding to the axes of the relevant dataset.
     amp : float
         Amplitude of the Gaussian distribution.
     stddev : float
         Standard deviation of the Gaussian distribution.
     lattice_params : tuple
-        Tuple of lattice parameters (a, b, c, alpha, beta, gamma) for the
-         reciprocal lattice.
+        Lattice parameters [e.g., (a, b, c, alpha, beta, gamma)]. These should be provided in
+        the order corresponding to the axes of the relevant dataset.
     coeffs : list, optional
         Coefficients for the Gaussian expression, including cross-terms between axes.
          Default is [1, 0, 1, 0, 1, 0],
@@ -580,30 +535,39 @@ def generate_gaussian(H, K, L, amp, stddev, lattice_params, coeffs=None, center=
 
     Returns
     -------
-    gaussian : ndarray
+    gaussian : :class:`numpy.ndarray`
         3D Gaussian distribution array.
     """
-    if center is None:
-        center=(0,0,0)
     if coeffs is None:
-        coeffs = [1, 0, 1, 0, 1, 0]
-    a, b, c, al, be, ga = lattice_params
-    a_, b_, c_, _, _, _ = reciprocal_lattice_params((a, b, c, al, be, ga))
-    H = H-center[0]
-    K = K-center[1]
-    L = L-center[2]
-    H, K, L = np.meshgrid(H, K, L, indexing='ij')
-    gaussian = amp * np.exp(-(coeffs[0] * H ** 2 +
-                              coeffs[1] * (b_ * a_ / (a_ ** 2)) * H * K +
-                              coeffs[2] * (b_ / a_) ** 2 * K ** 2 +
-                              coeffs[3] * (b_ * c_ / (a_ ** 2)) * K * L +
-                              coeffs[4] * (c_ / a_) ** 2 * L ** 2 +
-                              coeffs[5] * (c_ * a_ / (a_ ** 2)) * L * H) / (2 * stddev ** 2))
-    if gaussian.ndim == 3:
-        gaussian = gaussian.transpose(1, 0, 2)
-    elif gaussian.ndim == 2:
-        gaussian = gaussian.transpose()
-    return gaussian.transpose(1, 0, 2)
+        coeffs = (1, 0, 1, 0, 1, 0)
+
+    # Reciprocal lattice parameters
+    a, b, c, alpha, beta, gamma = lattice_params
+    a_, b_, c_, *_ = reciprocal_lattice_params((a, b, c, alpha, beta, gamma))
+
+    # Shift coordinates
+    H = H - center[0]
+    K = K - center[1]
+    L = L - center[2]
+
+    # Build coordinate grid
+    H, K, L = np.meshgrid(H, K, L, indexing="ij")
+
+    A, B, C, D, E, F = coeffs
+
+    # Quadratic form in reciprocal space
+    quad = (
+        A * H**2
+        + B * (b_ / a_) * H * K
+        + C * (b_ / a_)**2 * K**2
+        + D * (b_ * c_ / a_**2) * K * L
+        + E * (c_ / a_)**2 * L**2
+        + F * (c_ / a_) * L * H
+    )
+
+    gaussian = amp * np.exp(-quad / (2 * stddev**2))
+
+    return gaussian
 
 class Puncher:
     """
@@ -615,18 +579,18 @@ class Puncher:
 
     Attributes
     ----------
-    punched : NXdata, optional
+    punched : :class:`nexusformat.nexus.tree.NXdata`, optional
         The dataset with regions modified (punched) based on the mask.
-    data : NXdata, optional
+    data : :class:`nexusformat.nexus.tree.NXdata`, optional
         The input dataset to be processed.
-    HH, KK, LL : ndarray
+    HH, KK, LL : :class:`numpy.ndarray`
         Meshgrid arrays representing the H, K, and L coordinates in reciprocal space.
-    mask : ndarray, optional
+    mask : :class:`numpy.ndarray`, optional
         The mask used for identifying and modifying specific regions in the dataset.
     reciprocal_lattice_params : tuple, optional
         The reciprocal lattice parameters derived from the lattice parameters.
     lattice_params : tuple, optional
-        The lattice parameters (a, b, c, alpha, beta, gamma).
+        The lattice parameters [e.g., (a, b, c, alpha, beta, gamma)].
     a, b, c, al, be, ga : float
         Individual lattice parameters.
     a_star, b_star, c_star, al_star, be_star, ga_star : float
@@ -665,14 +629,14 @@ class Puncher:
 
         Attributes
         ----------
-        punched : NXdata, optional
+        punched : :class:`nexusformat.nexus.tree.NXdata`, optional
             The dataset with modified (punched) regions, initialized as None.
-        data : NXdata, optional
+        data : :class:`nexusformat.nexus.tree.NXdata`, optional
             The input dataset to be processed, initialized as None.
-        HH, KK, LL : ndarray, optional
+        HH, KK, LL : :class:`numpy.ndarray`, optional
             Arrays representing the H, K, and L coordinates in reciprocal space,
              initialized as None.
-        mask : ndarray, optional
+        mask : :class:`numpy.ndarray`, optional
             The mask for identifying and modifying specific regions in the dataset,
              initialized as None.
         reciprocal_lattice_params : tuple, optional
@@ -700,7 +664,7 @@ class Puncher:
 
         Parameters
         ----------
-        data : NXdata
+        data : :class:`nexusformat.nexus.tree.NXdata`
             The dataset to be processed.
 
         Notes
@@ -709,15 +673,26 @@ class Puncher:
         """
         self.data = data
         if self.mask is None:
-            self.mask = np.zeros(data[data.signal].nxdata.shape)
-        self.HH, self.KK, self.LL = np.meshgrid(data[data.axes[0]],
-                                                data[data.axes[1]],
-                                                data[data.axes[2]],
+            self.mask = np.zeros(data.nxsignal.nxdata.shape)
+        if data.shape == (data.nxaxes[0].shape[0], data.nxaxes[1].shape[0], data.nxaxes[2].shape[0]):
+            self.HH, self.KK, self.LL = np.meshgrid(data.nxaxes[0],
+                                                data.nxaxes[1],
+                                                data.nxaxes[2],
                                                 indexing='ij')
+        elif data.shape == (data.nxaxes[0].shape[0]-1, data.nxaxes[1].shape[0]-1, data.nxaxes[2].shape[0]-1):
+            self.HH, self.KK, self.LL = np.meshgrid(data.nxaxes[0][:-1],
+                                                data.nxaxes[1][:-1],
+                                                data.nxaxes[2][:-1],
+                                                indexing='ij')
+        else:
+            raise ValueError("Data shape does not match axes lengths.")
+        
 
     def set_lattice_params(self, lattice_params):
         """
-        Set the lattice parameters and compute the reciprocal lattice parameters.
+        Set the lattice parameters [e.g., (a, b, c, alpha, beta, gamma)] and compute the reciprocal
+        lattice parameters. These should be provided in the order corresponding to the axes of the
+        relevant dataset.
 
         Parameters
         ----------
@@ -736,7 +711,7 @@ class Puncher:
 
         Parameters
         ----------
-        maskaddition : ndarray
+        maskaddition : :class:`numpy.ndarray`
             The mask to be added.
         """
         self.mask = np.logical_or(self.mask, maskaddition)
@@ -747,7 +722,7 @@ class Puncher:
 
         Parameters
         ----------
-        masksubtraction : ndarray
+        masksubtraction : :class:`numpy.ndarray`
             The mask to be subtracted.
         """
         self.mask = np.logical_and(self.mask, np.logical_not(masksubtraction))
@@ -769,7 +744,7 @@ class Puncher:
 
         Returns
         -------
-        mask : ndarray
+        mask : :class:`numpy.ndarray`
             Boolean mask identifying the Bragg peaks.
         """
         if coeffs is None:
@@ -787,7 +762,7 @@ class Puncher:
                < punch_radius ** 2
 
         if thresh:
-            mask = np.logical_and(mask, data[data.signal] > thresh)
+            mask = np.logical_and(mask, data.nxsignal > thresh)
 
         return mask
 
@@ -806,11 +781,11 @@ class Puncher:
 
         Returns
         -------
-        mask : ndarray
+        mask : :class:`numpy.ndarray`
             Boolean mask highlighting regions with high intensity.
         """
         data = self.data
-        counts = data[data.signal].nxdata
+        counts = data.nxsignal.nxdata
         mask = np.zeros(counts.shape)
 
         print(f"Shape of data is {counts.shape}") if verbose else None
@@ -851,7 +826,7 @@ class Puncher:
 
         Returns
         -------
-        mask : ndarray
+        mask : :class:`numpy.ndarray`
             Boolean mask for the specified coordinate.
         """
         if coeffs is None:
@@ -869,7 +844,7 @@ class Puncher:
                < punch_radius ** 2
 
         if thresh:
-            mask = np.logical_and(mask, data[data.signal] > thresh)
+            mask = np.logical_and(mask, data.nxsignal > thresh)
 
         return mask
 
@@ -882,9 +857,9 @@ class Puncher:
         """
         data = self.data
         self.punched = NXdata(NXfield(
-            np.where(self.mask, np.nan, data[data.signal].nxdata),
-            name=data.signal),
-            (data[data.axes[0]], data[data.axes[1]], data[data.axes[2]])
+            np.where(self.mask, np.nan, data.nxsignal.nxdata),
+            name=data.nxsignal.nxname),
+            (data.nxaxes[0], data.nxaxes[1], data.nxaxes[2])
         )
 
 
@@ -922,6 +897,56 @@ def _round_up_to_odd_integer(value):
 
     return i
 
+class Gaussian2DKernel(Kernel):
+    """
+    Initialize a 2D Gaussian kernel.
+
+    This constructor creates a 2D Gaussian kernel with the specified
+    standard deviation and size. The Gaussian kernel is generated based on
+    the provided coefficients and is then normalized.
+
+    Parameters
+    ----------
+    stddev : float
+        The standard deviation of the Gaussian distribution, which controls
+        the width of the kernel.
+
+    size : tuple of int
+        The dimensions of the kernel, given as (x_dim, y_dim).
+
+    coeffs : list of float, optional
+        Coefficients for the Gaussian expression.
+        The default is [1, 0, 1] corresponding to the Gaussian form:
+        (1 * X^2 + 0 * X * Y + 1 * Y^2).
+
+    Raises
+    ------
+    ValueError
+        If the dimensions in `size` are not positive integers.
+
+    Notes
+    -----
+    The kernel is generated over a grid that spans twice the size of
+    each dimension, and the resulting array is normalized.
+    """
+    _separable = True
+    _is_bool = False
+
+    def __init__(self, stddev, size, coeffs=None):
+        if not coeffs:
+            coeffs = [1, 0, 1]
+        x_dim, y_dim = size
+        x = np.linspace(-x_dim, x_dim, int(x_dim) + 1)
+        y = np.linspace(-y_dim, y_dim, int(y_dim) + 1)
+        X, Y = np.meshgrid(x, y)
+        array = np.exp(-(coeffs[0] * X ** 2 +
+                         coeffs[1] * X * Y +
+                         coeffs[2] * Y ** 2) / (2 * stddev ** 2)
+                       )
+        self._default_size = _round_up_to_odd_integer(stddev)
+        super().__init__(array)
+        self.normalize()
+        self._truncation = np.abs(1. - self._array.sum())
 
 class Gaussian3DKernel(Kernel):
     """
@@ -965,7 +990,7 @@ class Gaussian3DKernel(Kernel):
         x = np.linspace(-x_dim, x_dim, int(x_dim) + 1)
         y = np.linspace(-y_dim, y_dim, int(y_dim) + 1)
         z = np.linspace(-z_dim, z_dim, int(z_dim) + 1)
-        X, Y, Z = np.meshgrid(x, y, z)
+        X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
         array = np.exp(-(coeffs[0] * X ** 2 +
                          coeffs[1] * X * Y +
                          coeffs[2] * Y ** 2 +
@@ -989,19 +1014,19 @@ class Interpolator:
     interp_time : float or None
         Time taken for the last interpolation operation. Defaults to None.
 
-    window : ndarray or None
+    window : :class:`numpy.ndarray` or None
         Window function to be applied to the interpolated data. Defaults to None.
 
-    interpolated : ndarray or None
+    interpolated : :class:`numpy.ndarray` or None
         The result of the interpolation operation. Defaults to None.
 
-    data : NXdata or None
+    data : :class:`nexusformat.nexus.tree.NXdata` or None
         The dataset to be interpolated. Defaults to None.
 
-    kernel : ndarray or None
+    kernel : :class:`numpy.ndarray` or None
         The kernel used for convolution during interpolation. Defaults to None.
 
-    tapered : ndarray or None
+    tapered : :class:`numpy.ndarray` or None
         The interpolated data after applying the window function. Defaults to None.
     """
 
@@ -1033,10 +1058,22 @@ class Interpolator:
 
         Parameters
         ----------
-        data : NXdata
+        data : :class:`nexusformat.nexus.tree.NXdata`
             The dataset containing the data to be interpolated.
         """
         self.data = data
+        self.interpolated = data
+        self.tapered = data
+        if data.shape == (data.nxaxes[0].shape[0], data.nxaxes[1].shape[0], data.nxaxes[2].shape[0]):
+            self.q1 = data.nxaxes[0]
+            self.q2 = data.nxaxes[1]
+            self.q3 = data.nxaxes[2]
+        elif data.shape == (data.nxaxes[0].shape[0]-1, data.nxaxes[1].shape[0]-1, data.nxaxes[2].shape[0]-1):
+            self.q1 = data.nxaxes[0][:-1]
+            self.q2 = data.nxaxes[1][:-1]
+            self.q3 = data.nxaxes[2][:-1]
+        else:
+            raise ValueError("Data shape does not match axes lengths.")
 
     def set_kernel(self, kernel):
         """
@@ -1044,7 +1081,7 @@ class Interpolator:
 
         Parameters
         ----------
-        kernel : ndarray
+        kernel : :class:`numpy.ndarray`
             The kernel to be used for convolution during interpolation.
         """
         self.kernel = kernel
@@ -1083,7 +1120,7 @@ class Interpolator:
 
         print("Running interpolation...") if verbose else None
         result = np.real(
-            convolve_fft(self.data[self.data.signal].nxdata,
+            convolve_fft(self.data.nxsignal.nxdata,
                          self.kernel, allow_huge=True, return_fft=False))
         print("Interpolation finished.") if verbose else None
 
@@ -1110,14 +1147,15 @@ class Interpolator:
         -----
         The window function is generated based on the size of the dataset in each dimension.
         """
-        data = self.data
+        
+        q1,q2,q3 = self.q1, self.q2, self.q3
         tukey_H = np.tile(
-            scipy.signal.windows.tukey(len(data[data.axes[0]]), alpha=tukey_alphas[0])[:, None, None],
-            (1, len(data[data.axes[1]]), len(data[data.axes[2]]))
+            scipy.signal.windows.tukey(len(q1), alpha=tukey_alphas[0])[:, None, None],
+            (1, len(q2), len(q3))
         )
         tukey_K = np.tile(
-            scipy.signal.windows.tukey(len(data[data.axes[1]]), alpha=tukey_alphas[1])[None, :, None],
-            (len(data[data.axes[0]]), 1, len(data[data.axes[2]]))
+            scipy.signal.windows.tukey(len(q2), alpha=tukey_alphas[1])[None, :, None],
+            (len(q1), 1, len(q3))
         )
         window = tukey_H * tukey_K
 
@@ -1125,13 +1163,13 @@ class Interpolator:
         gc.collect()
 
         tukey_L = np.tile(
-            scipy.signal.windows.tukey(len(data[data.axes[2]]), alpha=tukey_alphas[2])[None, None, :],
-            (len(data[data.axes[0]]), len(data[data.axes[1]]), 1))
+            scipy.signal.windows.tukey(len(q3), alpha=tukey_alphas[2])[None, None, :],
+            (len(q1), len(q2), 1))
         window = window * tukey_L
 
         self.window = window
 
-    def set_hexagonal_tukey_window(self, tukey_alphas=(1.0, 1.0, 1.0, 1.0)):
+    def set_hexagonal_tukey_window(self, tukey_alphas=(1.0, 1.0, 1.0, 1.0), reverse_axes=False):
         """
         Set a hexagonal Tukey window function for data tapering.
 
@@ -1141,6 +1179,9 @@ class Interpolator:
             The alpha parameters for the Tukey window in each dimension and
             for the hexagonal truncation (H, HK, K, L).
             Default is (1.0, 1.0, 1.0, 1.0).
+        reverse_axes : bool, optional
+            If True, uses the first axis of the dataset as the out-of-plane axis. 
+            Default False, which uses the third axis as the out-of-plane axis.
 
         Notes
         -----
@@ -1148,37 +1189,38 @@ class Interpolator:
         preserves hexagonal symmetry.
 
         """
-        data = self.data
-        H_ = data[data.axes[0]]
-        K_ = data[data.axes[1]]
-        L_ = data[data.axes[2]]
+        
+        q1,q2,q3 = self.q1, self.q2, self.q3
+
+        if reverse_axes:
+            q1, q2, q3 = q3, q2, q1
 
         tukey_H = np.tile(
-            scipy.signal.windows.tukey(len(data[data.axes[0]]), alpha=tukey_alphas[0])[:, None, None],
-            (1, len(data[data.axes[1]]), len(data[data.axes[2]]))
+            scipy.signal.windows.tukey(len(q1), alpha=tukey_alphas[0])[:, None, None],
+            (1, len(q2), len(q3))
         )
         tukey_K = np.tile(
-            scipy.signal.windows.tukey(len(data[data.axes[1]]), alpha=tukey_alphas[1])[None, :, None],
-            (len(data[data.axes[0]]), 1, len(data[data.axes[2]]))
+            scipy.signal.windows.tukey(len(q2), alpha=tukey_alphas[1])[None, :, None],
+            (len(q1), 1, len(q3))
         )
         window = tukey_H * tukey_K
 
         del tukey_H, tukey_K
         gc.collect()
 
-        truncation = int((len(H_) - int(len(H_) * np.sqrt(2) / 2)) / 2)
+        truncation = int((len(q1) - int(len(q1) * np.sqrt(2) / 2)) / 2)
 
         tukey_HK = scipy.ndimage.rotate(
             np.tile(
                 np.concatenate(
                     (np.zeros(truncation)[:, None, None],
-                     scipy.signal.windows.tukey(len(H_) - 2 * truncation,
+                        scipy.signal.windows.tukey(len(q1) - 2 * truncation,
                                         alpha=tukey_alphas[2])[:, None, None],
-                     np.zeros(truncation)[:, None, None])),
-                (1, len(K_), len(L_))
+                        np.zeros(truncation)[:, None, None])),
+                (1, len(q2), len(q3))
             ),
             angle=45, reshape=False, mode='nearest',
-        )[0:len(H_), 0:len(K_), :]
+        )[0:len(q1), 0:len(q2), :]
         tukey_HK = np.nan_to_num(tukey_HK)
         window = window * tukey_HK
 
@@ -1186,13 +1228,92 @@ class Interpolator:
         gc.collect()
 
         tukey_L = np.tile(
-            scipy.signal.windows.tukey(len(data[data.axes[2]]), alpha=tukey_alphas[3])[None, None, :],
-            (len(data[data.axes[0]]), len(data[data.axes[1]]), 1)
+            scipy.signal.windows.tukey(len(q3), alpha=tukey_alphas[3])[None, None, :],
+            (len(q1), len(q2), 1)
         )
         window = window * tukey_L
 
         del tukey_L
         gc.collect()
+
+        if reverse_axes:
+            self.window = window.transpose(2,1,0)
+        else:
+            self.window = window
+
+    def set_ellipsoidal_tukey_window(self, tukey_alpha=1.0, coeffs=None):
+        """
+        Set an ellipsoidal Tukey window function for data tapering.
+
+        The Tukey window smoothly tapers the data to zero near the edges of the
+        elliptical region defined by quadratic form coefficients. This helps reduce
+        artifacts in Fourier transforms and other operations sensitive to boundary effects.
+
+        Parameters
+        ----------
+        tukey_alpha : float, optional
+            Tapering parameter for the Tukey window, between 0 and 1.
+            - `tukey_alpha = 0` results in a ellipsoidal window (no tapering).
+            - `tukey_alpha = 1` results in a full cosine taper.
+            Default is 1.0.
+
+        coeffs : tuple of float, optional
+            Coefficients `(c0, c1, c2, c3, c4, c5)` defining the ellipsoidal
+            quadratic form:
+                R^2 = c0*H^2 + c1*H*K + c2*K^2 + c3*K*L + c4*L^2 + c5*L*H
+            If None, coefficients are automatically set to match the edges of the
+            reciprocal space axes (H, K, L), which should be appropriate in cases
+            where H, K, and L are orthogonal.
+
+        Notes
+        -----
+        - The maximum allowed radius `Qmax` is determined from the minimum radius
+          value along the edges of reciprocal space.
+        - The Tukey window is applied radially as a function of the distance `R`
+          from the center, defined by the ellipsoidal quadratic form.
+
+        Sets
+        ----
+        self.window : :class:`numpy.ndarray`
+            A 3D array of the same shape as the data, containing the Tukey window
+            values between 0 and 1.
+        """
+
+        # Initialize axes
+        q1,q2,q3 = self.q1, self.q2, self.q3
+
+        # Initialize coeffs (default to window reaching edge of array)
+        smallest_extent = np.min([q1.max(), q2.max(), q3.max()])
+        c = coeffs if coeffs is not None else ((smallest_extent / q1.max()) ** 2,
+                                               0,
+                                               (smallest_extent / q2.max()) ** 2,
+                                               0,
+                                               (smallest_extent / q3.max()) ** 2,
+                                               0
+                                               )
+
+        # Create meshgrid
+        HH, KK, LL = np.meshgrid(q1,q2,q3, indexing='ij')
+
+        # Create radius array
+        RR = np.sqrt(
+            c[0] * HH ** 2 +
+            c[1] * HH * KK +
+            c[2] * KK ** 2 +
+            c[3] * KK * LL +
+            c[4] * LL ** 2 +
+            c[5] * LL * HH
+        )
+
+        # Check the edges of reciprocal space to verify Qmax
+        # Create list of pixels where H = H.max() or K = K.max() or L = L.max()
+        edges = np.where(np.logical_or(np.logical_or(HH == q1.max(), KK == q2.max()), LL == q3.max()), RR, RR.max())
+        Qmax = edges.min()
+        alpha = tukey_alpha
+        period = (Qmax * alpha) / np.pi
+
+        window = np.where(RR > Qmax * (1 - alpha), (np.cos((RR - Qmax * (1 - alpha)) / period) + 1) / 2, 1)
+        window = np.where(RR > Qmax, 0, window)
 
         self.window = window
 
@@ -1202,7 +1323,7 @@ class Interpolator:
 
         Parameters
         ----------
-        window : ndarray
+        window : :class:`numpy.ndarray`
             A custom window function to be applied to the interpolated data.
         """
         self.window = window
@@ -1221,86 +1342,141 @@ class Interpolator:
         self.tapered = self.interpolated * self.window
 
 
-def fourier_transform_nxdata(data, is_2d=False):
+def fourier_transform_nxdata(data, method='complete', verbose=True):
     """
-    Perform a 3D Fourier Transform on the given NXdata object.
-
-    This function applies an inverse Fourier Transform to the input data
-    using the `pyfftw` library to optimize performance. The result is a
-    transformed array with spatial frequency components calculated along
-    each axis.
+    Perform a Fourier Transform on an NXdata object.
 
     Parameters
     ----------
-    data : NXdata
-        An NXdata object containing the data to be transformed. It should
-        include the `signal` field for the data and `axes` fields
-        specifying the coordinate axes.
+    data : :class:`nexusformat.nexus.tree.NXdata`
+        An NXdata object containing the data to be transformed.
 
-    is_2d : bool
-        If true, skip FFT on out-of-plane direction and only do FFT
-        on axes 0 and 1. Default False.
+    method : {'complete', 'staged'}, optional
+        The FFT method to use:
+
+        - 'complete' (default): performs a full n-dimensional FFT using pyfftw.
+        - 'staged': performs a 2+1D FFT in two stages - first within the planes defined by the
+          first two axes, then along the third axis. Requires 3D data and the third axis
+          must be normal to the plane of the first two axes.
+
+    verbose : bool, optional
+        If True, prints progress messages during computation.
 
     Returns
     -------
-    NXdata
-        A new NXdata object containing the Fourier Transformed data. The
-        result includes:
-
-        - `dPDF`: The transformed data array.
-        - `x`, `y`, `z`: Arrays representing the real-space components along each axis.
+    :class:`nexusformat.nexus.tree.NXdata`
+        A new NXdata object containing the Fourier-transformed data (real part).
 
     Notes
     -----
-    - The FFT is performed in two stages: first along the last dimension of the input array and then along the first two dimensions.
-    - The function uses `pyfftw` for efficient computation of the Fourier Transform.
-    - The output frequency components are computed based on the step sizes of the original data axes.
-
+    - Uses `pyfftw` for efficient Fourier Transform computation.
+    - Only the real part of the FFT is returned.
+    - In version v0.1.15 and beyond, the default method was changed from 
+      `method='staged'` to `method='complete'`. Previous behavior can be restored
+      by explicitly setting `method='staged'`.
+    - `method='staged'` may produce incorrect results if the third coordinate axis
+      is not perpendicular to the plane of the first two axes; a warning is issued
+      in this case.
     """
+
+    fft_object = None
+    fft_array = None
+
     start = time.time()
-    print("Starting FFT.")
+    print("FFT started.")
 
-    padded = data[data.signal].nxdata
+    if method == 'complete':
 
-    fft_array = np.zeros(padded.shape)
+        warnings.warn(
+            "In version v0.1.15 and beyond, the default method was changed from method='staged' "
+            "to method='complete' to avoid issues with data containing a non-orthogonal third "
+            "coordinate axis. Previous behavior can be restored by using method='staged'."
+            )
 
-    print("FFT on axes 1,2")
+        print("Performing FFT...") if verbose else None
 
-    for k in range(0, padded.shape[2]):
-        fft_array[:, :, k] = np.real(
-            np.fft.fftshift(
-                pyfftw.interfaces.numpy_fft.ifftn(np.fft.fftshift(padded[:, :, k]),
-                                                  planner_effort='FFTW_MEASURE'))
+        # Allocate aligned complex array
+        fft_array = pyfftw.empty_aligned(data.shape, dtype='complex128')
+
+        # if axes is None:
+        if data.ndim == 3:
+            axes = (0,1,2)
+        elif data.ndim == 2:
+            axes = (0,1)
+
+        # Build FFTW plan
+        fft_object = pyfftw.FFTW(
+            fft_array,          # input
+            fft_array,          # output (in-place)
+            axes=axes,
+            direction='FFTW_BACKWARD',   # inverse FFT
+            flags=('FFTW_MEASURE',),
         )
-        print(f'k={k}                  ', end='\r')
 
-    if not is_2d:
-        print("FFT on axis 3")
-        for i in range(0, padded.shape[0]):
-            for j in range(0, padded.shape[1]):
-                f_slice = fft_array[i, j, :]
-                print(f'i={i}                  ', end='\r')
-                fft_array[i, j, :] = np.real(
+        # Copy real data into complex array
+        fft_array[:] = np.fft.ifftshift(data.nxsignal.nxdata)
+
+        # Execute FFT in-place
+        fft_object()
+
+        # Shift once at the end
+        fft_array = np.fft.fftshift(fft_array)
+
+        fft_real = fft_array.real
+
+    elif method == 'staged':
+
+        if data.ndim != 3:
+            raise ValueError("Staged FFT only implemented for 3D data.")
+        
+        warnings.warn(
+            "method='staged' is only valid when the third coordinate axis is normal to the "
+            "plane spanned by the first two axes. Use method=='complete' for general cases.")
+
+        input = data.nxsignal.nxdata
+
+        fft_real = np.zeros(input.shape)
+
+        print(f"Performing FFT on {data.nxaxes[0].nxname}{data.nxaxes[1].nxname} plane...")
+        for k in range(0, input.shape[2]):
+            fft_real[:, :, k] = np.real(
+                np.fft.fftshift(
+                    pyfftw.interfaces.numpy_fft.ifftn(np.fft.ifftshift(input[:, :, k]),
+                                                    planner_effort='FFTW_MEASURE'))
+            )
+            print(f'k={k}/{input.shape[2]}                  ', end='\r')
+
+        print(f"Performing FFT on {data.nxaxes[2].nxname} axis...")
+        for i in range(0, input.shape[0]):
+            for j in range(0, input.shape[1]):
+                f_slice = fft_real[i, j, :]
+                fft_real[i, j, :] = np.real(
                     np.fft.fftshift(
                         pyfftw.interfaces.numpy_fft.ifftn(np.fft.fftshift(f_slice),
-                                                          planner_effort='FFTW_MEASURE')
+                                                        planner_effort='FFTW_MEASURE')
                     )
                 )
+                print(f'i={i}/{input.shape[0]}                  ', end='\r')
 
     end = time.time()
-    print("FFT complete.")
-    print('FFT took ' + str(end - start) + ' seconds.')
+    print(f'FFT completed in {(end - start):.3f} seconds.')
 
-    H_step = data[data.axes[0]].nxdata[1] - data[data.axes[0]].nxdata[0]
-    K_step = data[data.axes[1]].nxdata[1] - data[data.axes[1]].nxdata[0]
-    L_step = data[data.axes[2]].nxdata[1] - data[data.axes[2]].nxdata[0]
+    coords = []
+    for i in range(data.ndim):
+        step = data.nxaxes[i].nxdata[1] - data.nxaxes[i].nxdata[0]
+        axis = NXfield(np.linspace(-0.5 / step, 0.5 / step, data.shape[i]))
+        coords.append(axis)
 
-    fft = NXdata(NXfield(fft_array, name='dPDF'),
-                 (NXfield(np.linspace(-0.5 / H_step, 0.5 / H_step, padded.shape[0]), name='x'),
-                  NXfield(np.linspace(-0.5 / K_step, 0.5 / K_step, padded.shape[1]), name='y'),
-                  NXfield(np.linspace(-0.5 / L_step, 0.5 / L_step, padded.shape[2]), name='z'),
-                  )
-                 )
+    fft = NXdata(
+        NXfield(fft_real),
+        tuple(coords)
+    )
+
+    # Clean up
+    del fft_real, fft_array, fft_object
+
+    gc.collect()
+
     return fft
 
 
@@ -1312,14 +1488,15 @@ class DeltaPDF:
 
         Attributes
         ----------
-        fft : NXdata or None
+        fft : :class:`nexusformat.nexus.tree.NXdata` or None
             The Fourier transformed data.
-        data : NXdata or None
+        data : :class:`nexusformat.nexus.tree.NXdata` or None
             The input diffraction data.
         lattice_params : tuple or None
-            Lattice parameters (a, b, c, al, be, ga).
+            Lattice parameters [e.g., (a, b, c, alpha, beta, gamma)]. These should be provided
+            in the order corresponding to the axes of the relevant dataset.
         reciprocal_lattice_params : tuple or None
-            Reciprocal lattice parameters (a*, b*, c*, al*, be*, ga*).
+            Reciprocal lattice parameters [e.g., (a*, b*, c*, al*, be*, ga*)].
         puncher : Puncher
             An instance of the Puncher class for generating masks and punching
             the data.
@@ -1328,19 +1505,19 @@ class DeltaPDF:
             windows to the data.
         padder : Padder
             An instance of the Padder class for padding the data.
-        mask : ndarray or None
+        mask : :class:`numpy.ndarray` or None
             The mask used for data processing.
         kernel : Kernel or None
             The kernel used for interpolation.
-        window : ndarray or None
+        window : :class:`numpy.ndarray` or None
             The window applied to the interpolated data.
-        padded : ndarray or None
+        padded : :class:`numpy.ndarray` or None
             The padded data.
-        tapered : ndarray or None
+        tapered : :class:`numpy.ndarray` or None
             The data after applying the window.
-        interpolated : NXdata or None
+        interpolated : :class:`nexusformat.nexus.tree.NXdata` or None
             The interpolated data.
-        punched : NXdata or None
+        punched : :class:`nexusformat.nexus.tree.NXdata` or None
             The punched data.
 
         """
@@ -1371,7 +1548,7 @@ class DeltaPDF:
 
         Parameters
         ----------
-        data : NXdata
+        data : :class:`nexusformat.nexus.tree.NXdata`
             The diffraction data to be processed.
         """
         self.data = data
@@ -1382,6 +1559,17 @@ class DeltaPDF:
         self.padded = data
         self.interpolated = data
         self.punched = data
+        
+        if data.shape == (data.nxaxes[0].shape[0], data.nxaxes[1].shape[0], data.nxaxes[2].shape[0]):
+            self.q1 = data.nxaxes[0]
+            self.q2 = data.nxaxes[1]
+            self.q3 = data.nxaxes[2]
+        elif data.shape == (data.nxaxes[0].shape[0]-1, data.nxaxes[1].shape[0]-1, data.nxaxes[2].shape[0]-1):
+            self.q1 = data.nxaxes[0][:-1]
+            self.q2 = data.nxaxes[1][:-1]
+            self.q3 = data.nxaxes[2][:-1]
+        else:
+            raise ValueError("Data shape does not match axes lengths.")
 
     def set_lattice_params(self, lattice_params):
         """
@@ -1391,7 +1579,8 @@ class DeltaPDF:
         Parameters
         ----------
         lattice_params : tuple of float
-            The lattice parameters (a, b, c, alpha, beta, gamma) in real space.
+            The lattice parameters [e.g., (a, b, c, alpha, beta, gamma)] in real space. These 
+            should be provided in the order corresponding to the axes of the relevant dataset.
         """
         self.lattice_params = lattice_params
         self.puncher.set_lattice_params(lattice_params)
@@ -1403,7 +1592,7 @@ class DeltaPDF:
 
          Parameters
          ----------
-         maskaddition : ndarray
+         maskaddition : :class:`numpy.ndarray`
              The mask to be added.
          """
         self.puncher.add_mask(maskaddition)
@@ -1415,7 +1604,7 @@ class DeltaPDF:
 
         Parameters
         ----------
-        masksubtraction : ndarray
+        masksubtraction : :class:`numpy.ndarray`
             The mask to be subtracted.
         """
         self.puncher.subtract_mask(masksubtraction)
@@ -1438,7 +1627,7 @@ class DeltaPDF:
 
         Returns
         -------
-        mask : ndarray
+        mask : :class:`numpy.ndarray`
             Boolean mask identifying the Bragg peaks.
         """
         return self.puncher.generate_bragg_mask(punch_radius, coeffs, thresh)
@@ -1458,7 +1647,7 @@ class DeltaPDF:
 
         Returns
         -------
-        mask : ndarray
+        mask : :class:`numpy.ndarray`
             Boolean mask highlighting regions with high intensity.
         """
         return self.puncher.generate_intensity_mask(thresh, radius, verbose)
@@ -1482,7 +1671,7 @@ class DeltaPDF:
 
         Returns
         -------
-        mask : ndarray
+        mask : :class:`numpy.ndarray`
             Boolean mask for the specified coordinate.
         """
         return self.puncher.generate_mask_at_coord(coordinate, punch_radius, coeffs, thresh)
@@ -1504,7 +1693,7 @@ class DeltaPDF:
 
         Parameters
         ----------
-        kernel : ndarray
+        kernel : :class:`numpy.ndarray`
             The kernel to be used for convolution during interpolation.
         """
         self.interpolator.set_kernel(kernel)
@@ -1558,7 +1747,7 @@ class DeltaPDF:
         self.interpolator.set_tukey_window(tukey_alphas)
         self.window = self.interpolator.window
 
-    def set_hexagonal_tukey_window(self, tukey_alphas=(1.0, 1.0, 1.0, 1.0)):
+    def set_hexagonal_tukey_window(self, tukey_alphas=(1.0, 1.0, 1.0, 1.0), reverse_axes=False):
         """
         Set a hexagonal Tukey window function for data tapering.
 
@@ -1567,14 +1756,52 @@ class DeltaPDF:
         tukey_alphas : tuple of floats, optional
             The alpha parameters for the Tukey window in each dimension and
              for the hexagonal truncation (H, HK, K, L). Default is (1.0, 1.0, 1.0, 1.0).
+        reverse_axes : bool, optional
+            If True, uses the first axis of the dataset as the out-of-plane axis. 
+            Default False, which uses the third axis as the out-of-plane axis.
 
         Notes
         -----
         The hexagonal Tukey window is applied to the dataset in a manner that
          preserves hexagonal symmetry.
         """
-        self.interpolator.set_hexagonal_tukey_window(tukey_alphas)
+        self.interpolator.set_hexagonal_tukey_window(tukey_alphas, reverse_axes)
         self.window = self.interpolator.window
+
+    def set_ellipsoidal_tukey_window(self, tukey_alpha=1.0, coeffs=None):
+        """
+        Set an ellipsoidal Tukey window function for data tapering.
+
+        The Tukey window smoothly tapers the data to zero near the edges of the
+        elliptical region defined by quadratic form coefficients. This helps reduce
+        artifacts in Fourier transforms and other operations sensitive to boundary effects.
+
+        Parameters
+        ----------
+        tukey_alpha : float, optional
+            Tapering parameter for the Tukey window, between 0 and 1.
+            - `tukey_alpha = 0` results in a ellipsoidal window (no tapering).
+            - `tukey_alpha = 1` results in a full cosine taper.
+            Default is 1.0.
+
+        coeffs : tuple of float, optional
+            Coefficients `(c0, c1, c2, c3, c4, c5)` defining the ellipsoidal
+            quadratic form:
+                R^2 = c0*H^2 + c1*H*K + c2*K^2 + c3*K*L + c4*L^2 + c5*L*H
+            If None, coefficients are automatically set to match the edges of the
+            reciprocal space axes (H, K, L), which should be appropriate in cases
+            where H, K, and L are orthogonal.
+
+        Notes
+        -----
+        - The maximum allowed radius `Qmax` is determined from the minimum radius
+          value along the edges of reciprocal space.
+        - The Tukey window is applied radially as a function of the distance `R`
+          from the center, defined by the ellipsoidal quadratic form.
+        """
+        self.interpolator.set_ellipsoidal_tukey_window(tukey_alpha=tukey_alpha, coeffs=coeffs)
+        self.window = self.interpolator.window
+
 
     def set_window(self, window):
         """
@@ -1582,7 +1809,7 @@ class DeltaPDF:
 
         Parameters
         ----------
-        window : ndarray
+        window : :class:`numpy.ndarray`
             A custom window function to be applied to the interpolated data.
         """
         self.interpolator.set_window(window)
@@ -1613,25 +1840,26 @@ class DeltaPDF:
 
         Returns
         -------
-        NXdata
+        :class:`nexusformat.nexus.tree.NXdata`
             The padded data with symmetric zero padding.
         """
         self.padded = self.padder.pad(padding)
 
-    def perform_fft(self, is_2d=False):
+    def perform_fft(self, is_2d=None, **kwargs):
         """
         Perform a 3D Fourier Transform on the padded data.
 
-        This method applies an inverse Fourier Transform to the padded data
-        using `pyfftw` for optimized performance. The result is stored in
-        the `fft` attribute as an NXdata object containing the transformed
-        spatial frequency components.
-
         Parameters
         ----------
-        is_2d : bool, optional
-           If True, performs the FFT only along the first two axes,
-           skipping the out-of-plane direction (default is False).
+        method : {'complete', 'staged'}, optional
+            The FFT method to use:
+            - 'complete' (default): performs a full n-dimensional FFT using pyfftw.
+            - 'staged': performs a 2+1D FFT in two stages—first within the planes defined by the
+            first two axes, then along the third axis. Requires 3D data and the third axis
+            must be normal to the plane of the first two axes.
+
+        verbose : bool, optional
+            If True, prints progress messages during computation.
 
         Returns
         -------
@@ -1640,11 +1868,18 @@ class DeltaPDF:
         Notes
         -----
         - Calls `fourier_transform_nxdata` to perform the transformation.
-        - The FFT is computed in two stages: first along the last dimension,
-         then along the first two dimensions.
         - The output includes frequency components computed from the step
          sizes of the original data axes.
 
         """
 
-        self.fft = fourier_transform_nxdata(self.padded, is_2d=is_2d)
+        if is_2d is not None:
+            warnings.warn(
+                "The 'is_2d' argument is deprecated and has no effect. "
+                "All FFTs now match the input dimensionality.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        # self.fft = fourier_transform_nxdata(self.padded, staged=staged, is_2d=is_2d)
+        self.fft = fourier_transform_nxdata(self.padded, **kwargs)
