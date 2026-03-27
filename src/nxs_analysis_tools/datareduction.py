@@ -57,6 +57,24 @@ def load_data(path, print_tree=True, **kwargs):
     return g.entry.data
 
 def indexulatorinator(sl, q):
+"""
+    Accesses the data within a nxlink LazyLoader object.
+
+    Parameters
+    ----------
+    sl : float or slice
+        The slice to access. Can be a float (to access a single point) or a slice (to access a range of points).
+
+    q : array-like
+        The array of values to index into.
+
+    Returns
+    -------
+    data : nxdata object
+        The loaded data stored in a nxdata object.
+
+    """
+           
     if type(sl) is float:
         return [np.argmin(np.abs(q - sl))]
     elif type(sl) is slice:
@@ -68,6 +86,24 @@ def indexulatorinator(sl, q):
         raise ValueError("Must slice with tuple or float for lazy loader to work")
 
 def lazy_loaded(path, print_tree=True, **kwargs):
+           """
+    Link data from a NeXus file at a specified path. It is assumed that the data follows the CHESS
+    file structure (i.e., root/entry/data/counts, etc.).
+
+    Parameters
+    ----------
+    path : str
+        The path to the NeXus data file.
+
+    print_tree : bool, optional
+        Whether to print the data tree upon loading. Default True.
+
+    Returns
+    -------
+    data : nxlink object
+        The linked data stored in a lazyloader object.
+
+    """
     g = nxload(path, **kwargs)
     qh, qk, ql = np.array(g.entry.transform.Qh), np.array(g.entry.transform.Qk), np.array(g.entry.transform.Ql)
     class LazyLoader:
